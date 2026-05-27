@@ -284,6 +284,7 @@ mcpdoc --yaml sample_config.yaml --json sample_config.json --urls LangGraph:http
 
 - `--follow-redirects`: Follow HTTP redirects (defaults to False)
 - `--timeout SECONDS`: HTTP request timeout in seconds (defaults to 10.0)
+- `--allowed-domains`: Additional allowed domains for linked documentation pages
 
 Example with additional options:
 
@@ -318,6 +319,26 @@ Each source must include an `llms_txt` URL and can optionally include a `name`:
   }
 ]
 ```
+
+### OAuth2-Protected Documentation
+
+If a documentation source is protected with OAuth2, add an optional `oauth2` block to that source.
+
+Supported OAuth2 flow: `client_credentials` (default).
+
+```yaml
+- name: Private Docs
+  llms_txt: https://docs.example.com/llms.txt
+  oauth2:
+    token_url: https://auth.example.com/oauth/token
+    client_id: your-client-id
+    client_secret: your-client-secret
+    scope: read:docs
+    # Optional (defaults to client_credentials)
+    grant_type: client_credentials
+```
+
+`mcpdoc` will automatically fetch a bearer token and attach it to requests for URLs in that source domain.
 
 ## Programmatic Usage
 
