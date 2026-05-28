@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 from urllib.parse import urlparse, urljoin
 
 import httpx
@@ -21,6 +22,27 @@ class DocSource(TypedDict):
 
     description: NotRequired[str]
     """Description of the documentation source (optional)."""
+
+    oauth2: NotRequired["OAuth2Config"]
+    """OAuth2 client-credentials configuration for protected docs."""
+
+
+class OAuth2Config(TypedDict):
+    """OAuth2 client credentials configuration."""
+
+    token_url: str
+    client_id: str
+    client_secret: str
+    scope: NotRequired[str]
+    audience: NotRequired[str]
+    grant_type: NotRequired[str]
+
+
+class OAuth2TokenCacheEntry(TypedDict):
+    """OAuth2 access token cache entry."""
+
+    access_token: str
+    expires_at: float
 
 
 def extract_domain(url: str) -> str:
@@ -74,6 +96,8 @@ def _get_fetch_description(has_local_sources: bool) -> str:
     description.extend(
         [
             "",
+            "If a source is configured with OAuth2, requests automatically use a bearer token.",
+            "",
             "Returns:",
             "    The fetched documentation content converted to markdown, or an error message",  # noqa: E501
             "    if the request fails or the URL is not from an allowed domain.",
@@ -90,6 +114,59 @@ def _normalize_path(path: str) -> str:
         if path.startswith("file://")
         else os.path.abspath(path)
     )
+
+
+def _get_oauth2_domain_match(url: str, oauth2_by_domain: dict[str, OAuth2Config]) -> str | None:
+    """Find the best matching configured domain for a URL."""
+    matches = [domain for domain in oauth2_by_domain if url.startswith(domain)]
+    if not matches:
+        return None
+    return max(matches, key=len)
+
+
+async def _get_oauth2_headers(
+    url: str,
+    httpx_client: httpx.AsyncClient,
+    oauth2_by_domain: dict[str, OAuth2Config],
+    oauth2_token_cache: dict[str, OAuth2TokenCacheEntry],
+) -> dict[str, str]:
+    """Return OAuth2 Authorization header when source domain is configured."""
+    domain = _get_oauth2_domain_match(url, oauth2_by_domain)
+    if domain is None:
+        return {}
+
+    cached_token = oauth2_token_cache.get(domain)
+    now = time.time()
+    if cached_token and cached_token["expires_at"] > now:
+        return {"Authorization": f"Bearer {cached_token['access_token']}"}
+
+    config = oauth2_by_domain[domain]
+    token_request_data = {
+        "grant_type": config.get("grant_type", "client_credentials"),
+        "client_id": config["client_id"],
+        "client_secret": config["client_secret"],
+    }
+
+    if config.get("scope"):
+        token_request_data["scope"] = config["scope"]
+    if config.get("audience"):
+        token_request_data["audience"] = config["audience"]
+
+    token_response = await httpx_client.post(config["token_url"], data=token_request_data)
+    token_response.raise_for_status()
+    token_payload = token_response.json()
+    access_token = token_payload.get("access_token")
+    if not access_token:
+        raise ValueError("OAuth2 token response missing access_token")
+
+    expires_in = token_payload.get("expires_in")
+    token_ttl = float(expires_in) if isinstance(expires_in, (int, float)) else 3600.0
+    oauth2_token_cache[domain] = {
+        "access_token": access_token,
+        "expires_at": now + max(token_ttl - 30.0, 1.0),
+    }
+
+    return {"Authorization": f"Bearer {access_token}"}
 
 
 def _get_server_instructions(doc_sources: list[DocSource]) -> str:
@@ -188,6 +265,32 @@ def create_server(
 
     # Parse the domain names in the llms.txt URLs and identify local file paths
     domains = set(extract_domain(entry["llms_txt"]) for entry in remote_sources)
+    oauth2_by_domain: dict[str, OAuth2Config] = {}
+    oauth2_token_cache: dict[str, OAuth2TokenCacheEntry] = {}
+
+    for entry in remote_sources:
+        oauth2_config = entry.get("oauth2")
+        if not oauth2_config:
+            continue
+
+        missing_fields = [
+            field
+            for field in ("token_url", "client_id", "client_secret")
+            if not oauth2_config.get(field)
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"OAuth2 config for {entry['llms_txt']} is missing required fields: "
+                + ", ".join(missing_fields)
+            )
+
+        domain = extract_domain(entry["llms_txt"])
+        existing_config = oauth2_by_domain.get(domain)
+        if existing_config and existing_config != oauth2_config:
+            raise ValueError(
+                f"Multiple OAuth2 configurations found for the same domain: {domain}"
+            )
+        oauth2_by_domain[domain] = oauth2_config
 
     # Add additional allowed domains if specified, or set to '*' if we have local files
     if allowed_domains:
@@ -255,7 +358,13 @@ def create_server(
                 )
 
             try:
-                response = await httpx_client.get(url, timeout=timeout)
+                headers = await _get_oauth2_headers(
+                    url=url,
+                    httpx_client=httpx_client,
+                    oauth2_by_domain=oauth2_by_domain,
+                    oauth2_token_cache=oauth2_token_cache,
+                )
+                response = await httpx_client.get(url, timeout=timeout, headers=headers)
                 response.raise_for_status()
                 content = response.text
 
@@ -279,7 +388,15 @@ def create_server(
                                 + ", ".join(domains)
                             )
 
-                        response = await httpx_client.get(new_url, timeout=timeout)
+                        redirect_headers = await _get_oauth2_headers(
+                            url=new_url,
+                            httpx_client=httpx_client,
+                            oauth2_by_domain=oauth2_by_domain,
+                            oauth2_token_cache=oauth2_token_cache,
+                        )
+                        response = await httpx_client.get(
+                            new_url, timeout=timeout, headers=redirect_headers
+                        )
                         response.raise_for_status()
                         content = response.text
 
